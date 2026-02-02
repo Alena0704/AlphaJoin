@@ -18,60 +18,65 @@ public class getruntimerandom {
     static final String queryplanDir = "../data";
     static final String queryEncodedDictDir = "./queryEncodedDict";
     static final int tableNumber = 28;
-    
-     public static void main(String[] args) throws IOException, SQLException, InterruptedException {
-        String[] fileList = new File(tablenameDir).list();
-        System.out.println(fileList.length);
-        Arrays.sort(fileList);
+    // Cколько различных перестановок хинтов генерировать на каждый запрос
+    static final int HINTS_PER_QUERY = 20;
 
-        HashSet<String> generateSet = new HashSet<>();
-        HashMap<String, int[]> joinMatrixDict = new HashMap<>();
-        ArrayList<String> table2int = new ArrayList<>();
-        HashSet<String> historySet = new HashSet<>();
-        prepareData(joinMatrixDict, table2int, historySet);
+    public static void main(String[] args) throws IOException, SQLException, InterruptedException {
+        // Версия генератора с перестановками джойнов:
+        //  - один проход по всем запросам
+        //  - для каждого запроса генерируется до HINTS_PER_QUERY случайных permutations
+        //    порядка таблиц (left-deep Leading(...) хинты).
+
+        String[] fileList = new File(tablenameDir).list();
+        if (fileList == null) {
+            System.err.println("No files in " + tablenameDir);
+            return;
+        }
+        Arrays.sort(fileList);
+        System.out.println(fileList.length);
 
         BufferedWriter bw = path2bwa(outputDir);
-        while (true) {
-            for (int i = 0; i < fileList.length; i++) {
-                //1.get number of join, query contact
-                String queryName = fileList[i];
-                String[] tables = getQueryTables(queryName);
-                int joinNumber = tables.length - 1;
+        Random rnd = new Random();
 
-                //2.make hint
-                generateSet.clear();
-                int[] state = joinMatrixDict.get(queryName).clone();
-                int[] matrix = new int[tableNumber * tableNumber];
-                generatematrix(state, matrix, joinNumber,
-                        generateSet, tables, table2int);
+        for (String queryName : fileList) {
+            String[] tables = getQueryTables(queryName);
+            if (tables.length < 2) {
+                // Нет соединений, пропускаем
+                continue;
+            }
 
-                //3.run hint query
-                //System.out.println(queryName +","+generateSet.size());
-                if (joinNumber < 5) {
-                    for (String line : generateSet) {
-                        if (historySet.contains(queryName + line))
-                            continue;
-                        historySet.add(queryName + line);
-                        //System.out.println(queryName + line);
-                        runQuery(queryName, line, bw);
-                    }
-                } else {
-                    int count = 0;
-                    for (String line : generateSet) {
-                        if (historySet.contains(queryName + line))
-                            continue;
-                        historySet.add(queryName + line);
-                        runQuery(queryName, line, bw);
-                        //System.out.println(queryName + line);
-                        count += 1;
-                        if (count > 25)
-                            break;
-                    }
+            // Собираем до HINTS_PER_QUERY различных перестановок порядка соединения.
+            HashSet<String> generated = new HashSet<>();
+            int attempts = 0;
+            int maxAttempts = HINTS_PER_QUERY * 50;
 
+            while (generated.size() < HINTS_PER_QUERY && attempts < maxAttempts) {
+                attempts++;
+                // случайная перестановка таблиц
+                List<String> perm = new ArrayList<>(Arrays.asList(tables));
+                Collections.shuffle(perm, rnd);
 
+                // Строим леводеревянный план: (((t0 t1) t2) t3) ...
+                String hintCore = perm.get(0);
+                for (int i = 1; i < perm.size(); i++) {
+                    hintCore = "( " + hintCore + " " + perm.get(i) + " )";
+                }
+
+                if (generated.contains(hintCore)) {
+                    continue;
+                }
+                generated.add(hintCore);
+
+                try {
+                    runQuery(queryName, hintCore, bw);
+                } catch (Exception e) {
+                    e.printStackTrace();
                 }
             }
         }
+
+        bw.flush();
+        bw.close();
     }
 
     static class Action {
@@ -173,10 +178,17 @@ public class getruntimerandom {
             matrix[index] = 0;
             int indexa = index / tableNumber;
             int indexb = index % tableNumber;
-            if (tempdect.get(table2int.get(indexa)).equals(tempdect.get(table2int.get(indexb)))) {
+            String ta = table2int.get(indexa);
+            String tb = table2int.get(indexb);
+            // If either table alias is not present in this particular query,
+            // just skip this edge instead of throwing a NullPointerException.
+            if (!tempdect.containsKey(ta) || !tempdect.containsKey(tb)) {
+                continue;
+            }
+            if (tempdect.get(ta).equals(tempdect.get(tb))) {
                 return;
             }
-            String string = "( " + tempdect.get(table2int.get(indexa)) + " " + tempdect.get(table2int.get(indexb)) + " )";
+            String string = "( " + tempdect.get(ta) + " " + tempdect.get(tb) + " )";
             correctcount += 1;
             for (String j : string.split(" "))
                 if (tempdect.containsKey(j))

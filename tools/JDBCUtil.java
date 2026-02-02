@@ -4,9 +4,10 @@ import java.sql.SQLException;
 
 public class JDBCUtil {
     private static final String DRIVER = "org.postgresql.Driver";
-    private static final String URL = "jdbc:postgresql://localhost:5432/imdb2013";
-    private static final String NAME = "postgres";
-    private static final String PASSWORD = "wk";
+    // Подключаемся к вашему инстансу Postgres на порту 5496, БД postgres, роль boo (как в psql).
+    private static final String URL = "jdbc:postgresql://localhost:5496/postgres";
+    private static final String NAME = "boo";
+    private static final String PASSWORD = "";
     private static Connection conn = null;
 
 
