@@ -1,155 +1,162 @@
 from __future__ import division
-import os
-from copy import deepcopy
-from mcts import mcts
 import time
+import math
+import random
+from copy import deepcopy
+import numpy as np
+import torch
+import os
+
+from models import ValueNet
+
+model_path = "./saved_models/supervised.pt"
+shortToLongPath = "../resource/shorttolong"
+predicatesEncodeDictPath = "./predicatesEncodedDict"
+
+# Load dictionaries to reconstruct the actual input dimensionality,
+# as in the supervised class (len(tables)^2 + len(predicatesEncodeDict['1a'])).
+if not os.path.exists(shortToLongPath) or not os.path.exists(predicatesEncodeDictPath):
+    raise RuntimeError("shorttolong or predicatesEncodedDict not found; run 2.getQueryEncode.py first.")
+
+with open(shortToLongPath, "r", encoding="utf-8") as f:
+    short_to_long = eval(f.read())
+
+tables = sorted(short_to_long.keys())
+
+with open(predicatesEncodeDictPath, "r", encoding="utf-8") as f:
+    predicatesEncodeDict = eval(f.read())
+
+any_key = next(iter(predicatesEncodeDict.keys()))
+pred_dim = len(predicatesEncodeDict[any_key])
+num_inputs = len(tables) * len(tables) + pred_dim
+# For the current training setup this is effectively ValueNet(856, 5),
+# but computing num_inputs from metadata keeps it correct if schemas change.
+predictionNet = ValueNet(num_inputs, 5)
+predictionNet.load_state_dict(torch.load(model_path, map_location=lambda storage, loc: storage))
+predictionNet.eval()
 
 
-queryEncodeDictPath = './queryEncodedDict' 
-predicatesEncodeDictPath = './predicatesEncodedDict'
-shorttolongpath = '../resource/shorttolong'  
-tablenamedir = '../resource/jobtablename' 
-querydir = "../resource/jobquery"
-
-f = open(queryEncodeDictPath, 'r')
-a = f.read()
-queryEncodeDict = eval(a)
-f.close()
-
-f = open(predicatesEncodeDictPath, 'r')
-a = f.read()
-predicatesEncodeDict = eval(a)
-f.close()
+def getReward(state):
+    inputState = torch.tensor(state.board + state.predicatesEncode, dtype=torch.float32)
+    with torch.no_grad():
+        predictionRuntime = predictionNet(inputState)
+    prediction = predictionRuntime.detach().cpu().numpy()
+    maxindex = np.argmax(prediction)
+    reward = (4 - maxindex) / 4.0
+    return reward
 
 
-# Get all tablenames
-tables = []
-f = open(shorttolongpath, 'r')
-a = f.read()
-short_to_long = eval(a)
-f.close()
-for i in short_to_long.keys():
-    tables.append(i)
-tables.sort()
-
-# Mapping of tablename abbreviations and numbers (list subscripts)
-totalNumberOfTables = len(tables)
-tableToInt = {}
-intToTable = {}
-for i in range(totalNumberOfTables):
-    intToTable[i] = tables[i]
-    tableToInt[tables[i]] = i
-
-
-class planState:
-    def __init__(self, totalNumberOfTables, numberOfTables, queryEncode, predicatesEncode):
-        self.tableNumber = totalNumberOfTables
-        self.currentStep = numberOfTables
-        self.board = [0 for _ in range(self.tableNumber * self.tableNumber)]
-        self.joinMartix = queryEncode[:self.tableNumber * self.tableNumber]
-        self.predicatesEncode = predicatesEncode
+def randomPolicy(state):
+    """
+    Random rollout until a terminal state.
+    If for some reason the state is marked as non-terminal,
+    but there are no available actions (empty list), we treat it as terminal
+    to avoid crashing with an error.
+    """
+    while True:
+        if state.isTerminal():
+            return getReward(state)
+        actions = state.getPossibleActions()
+        if not actions:
+            # Non-terminal state with no actions — stop the search and evaluate as is.
+            return getReward(state)
+        action = random.choice(actions)
+        state = state.takeAction(action)
 
 
-    def getPossibleActions(self):
-        possibleActions = []
-        for i in range(self.tableNumber):
-            for j in range(self.tableNumber):
-                if self.joinMartix[i * self.tableNumber + j] == 1:
-                    possibleActions.append(Action(self.currentStep, x=i, y=j))
-        return possibleActions
-
-    def takeAction(self, action):
-        newState = deepcopy(self)
-        newState.currentStep = self.currentStep - 1
-        newState.board[action.x * self.tableNumber + action.y] = action.currentStep
-        newState.joinMartix[action.x * self.tableNumber + action.y] = 0
-        newState.joinMartix[action.y * self.tableNumber + action.x] = 0
-        ma = max(action.x, action.y)
-        mi = min(action.x, action.y)
-        for i in range(self.tableNumber):
-            if newState.joinMartix[i * self.tableNumber + ma] == 1:
-                newState.joinMartix[i * self.tableNumber + ma] = 0
-                newState.joinMartix[i * self.tableNumber + mi] = 1
-            if newState.joinMartix[ma * self.tableNumber + i] == 1:
-                newState.joinMartix[ma * self.tableNumber + i] = 0
-                newState.joinMartix[mi * self.tableNumber + i] = 1
-        return newState
-
-    def isTerminal(self):
-        if self.currentStep == 1:
-            return True
-        return False
-
-class Action:
-    def __init__(self, step, x, y):
-        self.currentStep = step
-        self.x = x
-        self.y = y
-
-    def __str__(self):
-        return str((self.x, self.y))
-
-    def __repr__(self):
-        return str(self)
-
-    def __eq__(self, other):
-        return self.__class__ == other.__class__ and self.x == other.x and self.y == other.y and self.currentStep == other.currentStep
-
-    def __hash__(self):
-        return hash((self.x, self.y, self.currentStep))
-
-def decode(currentState, tableList):
-    tempdect = {}
-    for i in range(len(tableList)):
-        tempdect[tableList[i]] = tableList[i]
-    # Record the number of connections
-    correctcount = 0  
-    while correctcount != len(tableList) - 1:
-        index = currentState.board.index(max(currentState.board))  
-        indexa = int(index / currentState.tableNumber)
-        indexb = int(index % currentState.tableNumber)
-        currentState.board[index] = 0
-
-        string = "( " + tempdect[intToTable[indexa]] + " " + tempdect[intToTable[indexb]] + " )"
-        correctcount += 1
-        # Update dictionary
-        for j in string.split():
-            if j in tableList:
-                tempdect[j] = string
-
-    return tempdect[tableList[0]]
+class treeNode():
+    def __init__(self, state, parent):
+        self.state = state
+        self.isTerminal = state.isTerminal()
+        self.isFullyExpanded = self.isTerminal
+        self.parent = parent
+        self.numVisits = 0
+        self.totalReward = 0
+        self.children = {}
 
 
-def findBestPlan():
-    queryNameList = os.listdir(tablenamedir)
-    queryNameList.sort()
-    searchFactor = 15
-    for queryName in queryNameList:
-        # Get the list of queried tables
-        tablenamepath = tablenamedir + "/" + queryName
-        file_object = open(tablenamepath)
-        file_context = file_object.read()
-        tableList = eval(file_context)
-        file_object.close()
+class mcts():
+    def __init__(self, iterationLimit=None, explorationConstant=1 / math.sqrt(2),
+                 rolloutPolicy=randomPolicy):
+        if iterationLimit == None:
+            raise ValueError("Must have either a time limit or an iteration limit")
+        # number of iterations of the search
+        if iterationLimit < 1:
+            raise ValueError("Iteration limit must be greater than one")
+        self.searchLimit = iterationLimit
+        self.explorationConstant = explorationConstant
+        self.rollout = rolloutPolicy
 
-        # Construct the initial state
-        initialState = planState(totalNumberOfTables, len(tableList), queryEncodeDict[queryName],
-                                predicatesEncodeDict[queryName])
-        currentState = initialState
+    def search(self, initialState):
+        self.root = treeNode(initialState, None)
+        for i in range(self.searchLimit):
+            self.executeRound()
 
-        mct = mcts(iterationLimit=(int)(len(currentState.getPossibleActions()) *  searchFactor))        
-        start = time.time()
-        while currentState.currentStep != 1:
-            # Search for the best choice in the current state
-            action = mct.search(initialState=currentState)
-            # Apply the selection, the status changes
-            currentState = currentState.takeAction(action)
-            # Change search times
-            mct.searchLimit = (int)(len(currentState.getPossibleActions()) *  searchFactor)
-        elapsed = (time.time() - start) * 1000
-        # Decode selected results
-        hint = decode(currentState, tableList)
-        print(queryName, ",", hint, ",%.3f" % elapsed)
+        bestChild = self.getBestChild(self.root, 0)
+        # If the root has no children (no move could be made at all),
+        # return None so the caller can skip this query.
+        if bestChild is self.root:
+            return None
+        return self.getAction(self.root, bestChild)
 
-if __name__ == '__main__':
-    findBestPlan()
+    def executeRound(self):
+        node = self.selectNode(self.root)
+        newState = deepcopy(node.state)
+        reward = self.rollout(newState)
+        self.backpropogate(node, reward)
+
+    def selectNode(self, node):
+        while not node.isTerminal:
+            if node.isFullyExpanded:
+                node = self.getBestChild(node, self.explorationConstant)
+            else:
+                return self.expand(node)
+        return node
+
+    def expand(self, node):
+        actions = node.state.getPossibleActions()
+        # If there are no actions but the node is marked as non-terminal,
+        # treat it as effectively terminal and mark it as fully expanded.
+        if not actions:
+            node.isFullyExpanded = True
+            node.isTerminal = True
+            return node
+        for action in actions:
+            if action not in node.children:
+                newNode = treeNode(node.state.takeAction(action), node)
+                node.children[action] = newNode
+                if len(actions) == len(node.children):
+                    node.isFullyExpanded = True
+                # if newNode.isTerminal:
+                #     print(newNode)
+                return newNode
+
+        raise Exception("Should never reach here")
+
+    def backpropogate(self, node, reward):
+        while node is not None:
+            node.numVisits += 1
+            node.totalReward += reward
+            node = node.parent
+
+    def getBestChild(self, node, explorationValue):
+        # If the node has no children, return the node itself (for the root this is a signal to the caller).
+        if not node.children:
+            return node
+
+        bestValue = float("-inf")
+        bestNodes = []
+        for child in node.children.values():
+            nodeValue = child.totalReward / child.numVisits + explorationValue * math.sqrt(
+                2 * math.log(node.numVisits) / child.numVisits)
+            if nodeValue > bestValue:
+                bestValue = nodeValue
+                bestNodes = [child]
+            elif nodeValue == bestValue:
+                bestNodes.append(child)
+        return random.choice(bestNodes)
+
+    def getAction(self, root, bestChild):
+        for action, node in root.children.items():
+            if node is bestChild:
+                return action

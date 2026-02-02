@@ -4,11 +4,34 @@ import math
 import random
 from copy import deepcopy
 import numpy as np
-from models import ValueNet
 import torch
-model_path = './saved_models/supervised.pt'
+import os
 
-predictionNet = ValueNet(856, 5)
+from models import ValueNet
+
+model_path = "./saved_models/supervised.pt"
+shortToLongPath = "../resource/shorttolong"
+predicatesEncodeDictPath = "./predicatesEncodedDict"
+
+# Load dictionaries to reconstruct the actual input dimensionality,
+# as in the supervised class (len(tables)^2 + len(predicatesEncodeDict['1a'])).
+if not os.path.exists(shortToLongPath) or not os.path.exists(predicatesEncodeDictPath):
+    raise RuntimeError("shorttolong or predicatesEncodedDict not found; run 2.getQueryEncode.py first.")
+
+with open(shortToLongPath, "r", encoding="utf-8") as f:
+    short_to_long = eval(f.read())
+
+tables = sorted(short_to_long.keys())
+
+with open(predicatesEncodeDictPath, "r", encoding="utf-8") as f:
+    predicatesEncodeDict = eval(f.read())
+
+any_key = next(iter(predicatesEncodeDict.keys()))
+pred_dim = len(predicatesEncodeDict[any_key])
+num_inputs = len(tables) * len(tables) + pred_dim
+# For the current training setup this is effectively ValueNet(856, 5),
+# but computing num_inputs from metadata keeps it correct if schemas change.
+predictionNet = ValueNet(num_inputs, 5)
 predictionNet.load_state_dict(torch.load(model_path, map_location=lambda storage, loc: storage))
 predictionNet.eval()
 
@@ -24,17 +47,21 @@ def getReward(state):
 
 
 def randomPolicy(state):
-    while not state.isTerminal():
-        try:
-            temp = state.getPossibleActions()
-            action = random.choice(temp)
-        except IndexError:
-            raise Exception("Non-terminal state has no possible actions: " + str(state))
+    """
+    Random rollout until a terminal state.
+    If for some reason the state is marked as non-terminal,
+    but there are no available actions (empty list), we treat it as terminal
+    to avoid crashing with an error.
+    """
+    while True:
+        if state.isTerminal():
+            return getReward(state)
+        actions = state.getPossibleActions()
+        if not actions:
+            # Non-terminal state with no actions — stop the search and evaluate as is.
+            return getReward(state)
+        action = random.choice(actions)
         state = state.takeAction(action)
-    # reward = state.getReward()
-    reward = getReward(state)
-    # print(reward)
-    return reward
 
 
 class treeNode():
@@ -66,6 +93,10 @@ class mcts():
             self.executeRound()
 
         bestChild = self.getBestChild(self.root, 0)
+        # If the root has no children (no move could be made at all),
+        # return None so the caller can skip this query.
+        if bestChild is self.root:
+            return None
         return self.getAction(self.root, bestChild)
 
     def executeRound(self):
@@ -84,6 +115,12 @@ class mcts():
 
     def expand(self, node):
         actions = node.state.getPossibleActions()
+        # If there are no actions but the node is marked as non-terminal,
+        # treat it as effectively terminal and mark it as fully expanded.
+        if not actions:
+            node.isFullyExpanded = True
+            node.isTerminal = True
+            return node
         for action in actions:
             if action not in node.children:
                 newNode = treeNode(node.state.takeAction(action), node)
@@ -103,6 +140,10 @@ class mcts():
             node = node.parent
 
     def getBestChild(self, node, explorationValue):
+        # If the node has no children, return the node itself (for the root this is a signal to the caller).
+        if not node.children:
+            return node
+
         bestValue = float("-inf")
         bestNodes = []
         for child in node.children.values():

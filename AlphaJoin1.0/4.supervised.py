@@ -3,7 +3,6 @@ import random
 import os
 import numpy as np
 import torch
-import pickle
 from models import ValueNet
 
 shortToLongPath = '../resource/shorttolong'
@@ -18,8 +17,8 @@ class data:
 
 
 class supervised:
-    def __init__(self, args): 
-        # Read dict predicatesEncoded 
+    def __init__(self, args):
+        # Read dict predicatesEncoded
         f = open(predicatesEncodeDictPath, 'r')
         a = f.read()
         self.predicatesEncodeDict = eval(a)
@@ -37,12 +36,14 @@ class supervised:
         self.table_to_int = {}
         for i in range(len(tables)):
             self.table_to_int[tables[i]] = i
-        
+
         # The dimension of the network input vector
         self.num_inputs = len(tables) * len(tables) + len(self.predicatesEncodeDict["1a"])
         # The dimension of the vector output by the network
-        self.num_output = 5    
+        self.num_output = 5
         self.args = args
+        # How to interpret timeouts when building the dataset
+        self.timeout_value = int(getattr(args, "timeout_value", 10**9))
         self.right = 0
 
         # build up the network
@@ -53,12 +54,12 @@ class supervised:
 
         self.dataList = []
         self.testList = []
-    
 
     # Parsing query plan
-    def hint2matrix(self, hint):        
+    def hint2matrix(self, hint):
         tablesInQuery = hint.split(" ")
-        matrix = np.mat(np.zeros((len(self.table_to_int), len(self.table_to_int))))
+        # NumPy 2.0: np.mat was removed, use a regular ndarray
+        matrix = np.zeros((len(self.table_to_int), len(self.table_to_int)))
         stack = []
         difference = 0
         for i in tablesInQuery:
@@ -82,6 +83,9 @@ class supervised:
 
     # Divide training set and test set
     def pretreatment(self, path):
+        # Ensure output directory exists (for the future, if we ever want to write files)
+        if not os.path.exists("./data"):
+            os.makedirs("./data", exist_ok=True)
         # Load data uniformly and randomly select for training
         file_test = open(path)
         line = file_test.readline()
@@ -90,13 +94,15 @@ class supervised:
             hint = line.split(",")[1]
             matrix = self.hint2matrix(hint)
             predicatesEncode = self.predicatesEncodeDict[queryName]
-            state = matrix.flatten().tolist()[0]
+            # matrix.flatten().tolist() already returns a flat list of numbers
+            state = matrix.flatten().tolist()
             state = state + predicatesEncode
-            runtime = line.split(",")[2].strip()
-            if runtime == 'timeout':  
-                runtime = ??  # Depends on your settings
-            else:
-                runtime = int(float(runtime))
+            runtime_str = line.split(",")[2].strip()
+            try:
+                runtime = int(float(runtime_str))
+            except Exception:
+                # set statement timeout
+                runtime = self.timeout_value
             temp = data(state, runtime)
             self.dataList.append(temp)
             line = file_test.readline()
@@ -111,19 +117,10 @@ class supervised:
             self.testList.append(temp)
 
         print("size of test set:", len(self.testList), "\tsize of train set:", len(self.dataList))
-        testpath = "./data/testdata.sql"
-        file_test = open(testpath, 'wb')
-        pickle.dump(len(self.testList), file_test)
-        for value in self.testList:
-            pickle.dump(value, file_test)
-        file_test.close()
+        # Previously, the dataset was serialized to files using pickle.
+        # In Python 3 with our proxied module scheme this causes errors.
+        # For training and testing it's sufficient to keep the data in memory.
 
-        trainpath = "./data/traindata.sql"
-        file_train = open(trainpath, 'wb')
-        pickle.dump(len(self.dataList), file_train)
-        for value in self.dataList:
-            pickle.dump(value, file_train)
-        file_train.close()
 
     # functions to train the network
     def supervised(self):
@@ -135,7 +132,7 @@ class supervised:
         loss1000 = 0
         count = 0
 
-        for step in range(1, 16000001):
+        for step in range(1, 600001):
             index = random.randint(0, len(self.dataList) - 1)
             state = self.dataList[index].state
             state_tensor = torch.tensor(state, dtype=torch.float32)
@@ -149,13 +146,14 @@ class supervised:
 
             loss = loss_func(predictionRuntime, label_tensor)
 
-            optim.zero_grad() 
-            loss.backward() 
-            optim.step() 
+            optim.zero_grad()
+            loss.backward()
+            optim.step()
             loss1000 += loss.item()
             if step % 1000 == 0:
                 print('[{}]  Epoch: {}, Loss: {:.5f}'.format(datetime.now(), step, loss1000))
                 loss1000 = 0
+                # Run validation and check for improvement
                 self.test_network()
                 print('[{}]  Epoch: {}, Loss: {:.5f}'.format(datetime.now(), step, loss1000))
             if step % 200000 == 0:
@@ -166,15 +164,21 @@ class supervised:
     def test_network(self):
         self.load_data()
         model_path = self.args.save_dir + 'supervised.pt'
-        self.actor_net.load_state_dict(torch.load(model_path, map_location=lambda storage, loc: storage))
-        self.actor_net.eval()
+        # In the original code this used actor_net, but in this version
+        # we only have value_net — so we also use it for testing.
+        # On early iterations the model file may not exist yet.
+        if os.path.exists(model_path):
+            self.value_net.load_state_dict(
+                torch.load(model_path, map_location=lambda storage, loc: storage)
+            )
+        self.value_net.eval()
 
         correct = 0
         for step in range(self.testList.__len__()):
             state = self.testList[step].state
             state_tensor = torch.tensor(state, dtype=torch.float32)
 
-            predictionRuntime = self.actor_net(state_tensor)
+            predictionRuntime = self.value_net(state_tensor)
             prediction = predictionRuntime.detach().cpu().numpy()
             maxindex = np.argmax(prediction)
             label = self.testList[step].label
@@ -188,7 +192,7 @@ class supervised:
             state = self.dataList[step].state
             state_tensor = torch.tensor(state, dtype=torch.float32)
 
-            predictionRuntime = self.actor_net(state_tensor)
+            predictionRuntime = self.value_net(state_tensor)
             # prediction = predictionRuntime.detach().cpu().numpy()[0]
             prediction = predictionRuntime.detach().cpu().numpy()
             maxindex = np.argmax(prediction)
@@ -200,18 +204,14 @@ class supervised:
         self.right = correct / self.testList.__len__()
 
     def load_data(self):
-        if self.dataList.__len__() != 0:
+        """
+        In the simplified flow the data is already loaded by pretreatment()
+        before training/testing. If not, we load it from the original CSV.
+        """
+        if self.dataList:
             return
-        testpath = "./data/testdata.sql"
-        file_test = open(testpath, 'rb')
-        l = pickle.load(file_test)
-        for _ in range(l):
-            self.testList.append(pickle.load(file_test))
-        file_test.close()
-
-        trainpath = "./data/traindata.sql"
-        file_train = open(trainpath, 'rb')
-        l = pickle.load(file_train)
-        for _ in range(l):
-            self.dataList.append(pickle.load(file_train))
-        file_train.close()
+        # If the arrays are empty, run pretreatment again
+        if hasattr(self.args, "data_file"):
+            self.pretreatment(self.args.data_file)
+        else:
+            raise RuntimeError("No data loaded and no args.data_file specified")

@@ -8,7 +8,8 @@ if __name__ == '__main__':
 
     trainer = supervised(args)
     print("Pretreatment running...")
-    start = time.clock()
-    trainer.pretreatment("./data/XXX.sql")
-    elapsed = (time.clock() - start)
+    start = time.perf_counter()
+    # Use the path passed via CLI arguments
+    trainer.pretreatment(args.data_file)
+    elapsed = (time.perf_counter() - start)
     print("Pretreatment time used:", elapsed)
